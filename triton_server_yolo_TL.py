@@ -1,155 +1,249 @@
-import os
 import sys
-from collections import deque
-from pathlib import Path
+import os
 
-import numpy as np
+import cv2
 import torch
-import grpc
+import numpy as np
 import tritonclient.grpc as grpcclient
-
-FILE = Path(__file__).resolve()
-ROOT = FILE.parents[0]  # YOLOv5 root directory
-if str(ROOT) not in sys.path:
-    sys.path.append(str(ROOT))  # add ROOT to PATH
-ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
-
-from utils.general import (Profile, check_img_size, cv2, non_max_suppression, scale_boxes)
-from utils.torch_utils import select_device
 
 from utils.augmentations import letterbox
 
 
-def get_traffic_light_color(im0, x1, y1, x2, y2):
-    traffic_light = im0[int(y1):int(y2), int(x1):int(x2)]
-    hsv = cv2.cvtColor(traffic_light, cv2.COLOR_BGR2HSV)
+# triton server connection
+try:
+    triton_client = grpcclient.InferenceServerClient(url="localhost:8001")
+except:
+    print("channel creation failed: " + str(Exception))
+    sys.exit()
 
-    # Red color
-    low_red = np.array([161, 155, 84])
-    low_red_2 = np.array([0, 155, 84])
-    high_red = np.array([179, 255, 255])
-    high_red_2 = np.array([10, 255, 255])
-    red_mask = cv2.inRange(hsv, low_red, high_red)
-    red_mask_2 = cv2.inRange(hsv, low_red_2, high_red_2)
-    red = cv2.bitwise_and(traffic_light, traffic_light, mask=red_mask)
-    red_2 = cv2.bitwise_and(traffic_light, traffic_light, mask=red_mask_2)
+model_name = "yolov5"
+input_width = 640
+input_height = 640
+conf_thresh = 0.45
+batch_size = 1
+input_shape = [batch_size, 3, input_height, input_width]
+input_name = "images"
+output_name = "output0"
+output_size = 25200
+fp = "FP16"
+stride = 32
+np_dtype = np.float16
+IOU_THRESHOLD = 0.45
 
-    # Green color
-    low_green = np.array([25, 52, 72])
-    high_green = np.array([102, 255, 255])
-    green_mask = cv2.inRange(hsv, low_green, high_green)
-    green = cv2.bitwise_and(traffic_light, traffic_light, mask=green_mask)
 
-    # Yellow color
-    low_yellow = np.array([20, 100, 100])
-    high_yellow = np.array([30, 255, 255])
-    yellow_mask = cv2.inRange(hsv, low_yellow, high_yellow)
-    yellow = cv2.bitwise_and(traffic_light, traffic_light, mask=yellow_mask)
+def predict(input_images, input_name=input_name, output_name=output_name, fp=fp, triton_client=triton_client):
+    inputs = []
+    outputs = []
 
-    if red.any() or yellow.any():
-        traffic_light_color = 'red'
-    elif green.any():
-        traffic_light_color = 'green'
+    inputs.append(grpcclient.InferInput(input_name, [*input_images.shape], fp))
+
+    # data initialize
+    inputs[-1].set_data_from_numpy(input_images)
+    outputs.append(grpcclient.InferRequestedOutput(output_name))
+    results = triton_client.infer(model_name=model_name, inputs=inputs, outputs=outputs)
+
+    return results.as_numpy(output_name)
+
+
+def clip_boxes(boxes, shape):
+    # Clip boxes (xyxy) to image shape (height, width)
+    if isinstance(boxes, torch.Tensor):  # faster individually
+        boxes[..., 0].clamp_(0, shape[1])  # x1
+        boxes[..., 1].clamp_(0, shape[0])  # y1
+        boxes[..., 2].clamp_(0, shape[1])  # x2
+        boxes[..., 3].clamp_(0, shape[0])  # y2
+    else:  # np.array (faster grouped)
+        boxes[..., [0, 2]] = boxes[..., [0, 2]].clip(0, shape[1])  # x1, x2
+        boxes[..., [1, 3]] = boxes[..., [1, 3]].clip(0, shape[0])  # y1, y2
+
+
+def scale_boxes(img1_shape, boxes, img0_shape, ratio_pad=None):
+    # Rescale boxes (xyxy) from img1_shape to img0_shape
+    if ratio_pad is None:  # calculate from img0_shape
+        gain = min(
+            img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1]
+        )  # gain  = old / new
+        pad = (img1_shape[1] - img0_shape[1] * gain) / 2, (
+            img1_shape[0] - img0_shape[0] * gain
+        ) / 2  # wh padding
     else:
-        traffic_light_color = 'unknown'
+        gain = ratio_pad[0][0]
+        pad = ratio_pad[1]
 
-    return traffic_light_color
-
-
-def run(frame, conf_thres=0.25, iou_thres=0.45, max_det=1000,
-        classes=[0, 1, 2, 3, 5, 7, 9, 10], agnostic_nms=False, augment=False):
-    im = letterbox(frame, imgsz, stride, auto=True)[0]  # padded resize
-    im = im.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
-    im = np.ascontiguousarray(im)  # contiguous
-    dt = (Profile(), Profile(), Profile())
-    with dt[0]:
-        im = torch.from_numpy(im).to(device)
-        im = im.half() if fp16 else im.float()  # uint8 to fp16/32
-        im /= 255
-        if len(im.shape) == 3:
-            im = im[None]  # expand for batch dim
-    with dt[1]:
-        # Connect to the Triton server
-        triton_client = grpcclient.InferenceServerClient(url="localhost:8001")
-        # Create the data for the input tensor
-        data = grpcclient.InferInput('input_0', im.shape, "FP16")
-        # Set the data for the input tensor
-        data.set_data_from_numpy(im, binary_data=True)
-        # Execute the model
-        result = triton_client.infer("yolov5", model_version="1", inputs=[data])
-        # Get the output tensor
-        output = result.as_numpy('output_0')
-    with dt[2]:
-        pred = non_max_suppression(output, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
-    for i, det in enumerate(pred):  # per image
-        im0 = frame.copy()
-        if len(det):
-            det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
-            for *xyxy, conf, cls in reversed(det):
-                c = int(cls)  # integer class
-                if c == 9:
-                    x1, y1, x2, y2 = [coord.item() for coord in xyxy]
-                    color = get_traffic_light_color(im0, x1, y1, x2, y2)
-                    return x1, y1, x2, y2, color, conf.item()
-                    # return f"{c}, Traffic Light detected in color: {color}"
-    return f"unknown"
+    boxes[..., [0, 2]] -= pad[0]  # x padding
+    boxes[..., [1, 3]] -= pad[1]  # y padding
+    boxes[..., :4] /= gain
+    clip_boxes(boxes, img0_shape)
+    return boxes
 
 
-device = select_device('')
-weights = ROOT / 'yolov5m.pt'
-data = ROOT / 'data/coco128.yaml'
-video_name = 'TLD120new.mp4'
+def xywh2xyxy(x):
+    y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
+    y[..., 0] = x[..., 0] - x[..., 2] / 2  # top left x
+    y[..., 1] = x[..., 1] - x[..., 3] / 2  # top left y
+    y[..., 2] = x[..., 0] + x[..., 2] / 2  # bottom right x
+    y[..., 3] = x[..., 1] + x[..., 3] / 2  # bottom right y
+    return y
 
-video = ROOT / f'data/videos/{video_name}'
-imgsz = (1080, 1920)
-stride, pt = 32, False
-imgsz = check_img_size(imgsz, s=stride)  # check image size
-bs = 1  # batch_size
-fp16 = False
 
-cap = cv2.VideoCapture(f"{video}")
-# fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-# out_video = cv2.VideoWriter(f'data/videos/out_{video_name}', fourcc, 25.0, (1920, 1080))
-seen = 0
-# 创建一个队列，用于存储检测到的交通灯颜色，长度为5，初始值为unknown
-color_queue = deque(maxlen=5)
-color_queue.append('unknown')
-color_queue.append('unknown')
-color_queue.append('unknown')
-color_queue.append('unknown')
-color_queue.append('unknown')
+def bbox_iou(box1, box2, x1y1x2y2=True):
+    if not x1y1x2y2:
+        # Transform from center and width to exact coordinates
+        b1_x1, b1_x2 = box1[:, 0] - box1[:, 2] / 2, box1[:, 0] + box1[:, 2] / 2
+        b1_y1, b1_y2 = box1[:, 1] - box1[:, 3] / 2, box1[:, 1] + box1[:, 3] / 2
+        b2_x1, b2_x2 = box2[:, 0] - box2[:, 2] / 2, box2[:, 0] + box2[:, 2] / 2
+        b2_y1, b2_y2 = box2[:, 1] - box2[:, 3] / 2, box2[:, 1] + box2[:, 3] / 2
+    else:
+        # Get the coordinates of bounding boxes
+        b1_x1, b1_y1, b1_x2, b1_y2 = box1[:, 0], box1[:, 1], box1[:, 2], box1[:, 3]
+        b2_x1, b2_y1, b2_x2, b2_y2 = box2[:, 0], box2[:, 1], box2[:, 2], box2[:, 3]
+
+    # Get the coordinates of the intersection rectangle
+    inter_rect_x1 = np.maximum(b1_x1, b2_x1)
+    inter_rect_y1 = np.maximum(b1_y1, b2_y1)
+    inter_rect_x2 = np.minimum(b1_x2, b2_x2)
+    inter_rect_y2 = np.minimum(b1_y2, b2_y2)
+    # Intersection area
+    inter_area = np.clip(inter_rect_x2 - inter_rect_x1 + 1, 0, None) * np.clip(
+        inter_rect_y2 - inter_rect_y1 + 1, 0, None
+    )
+    # Union Area
+    b1_area = (b1_x2 - b1_x1 + 1) * (b1_y2 - b1_y1 + 1)
+    b2_area = (b2_x2 - b2_x1 + 1) * (b2_y2 - b2_y1 + 1)
+
+    iou = inter_area / (b1_area + b2_area - inter_area + 1e-16)
+
+    return iou
+
+
+def non_max_suppression(prediction, origin_h, origin_w, conf_thres=0.5, nms_thres=0.4):
+    boxes = prediction[prediction[:, 4] >= conf_thres]
+    boxes[:, :4] = xywh2xyxy(boxes[:, :4])
+    boxes[:, 0] = np.clip(boxes[:, 0], 0, origin_w - 1)
+    boxes[:, 2] = np.clip(boxes[:, 2], 0, origin_w - 1)
+    boxes[:, 1] = np.clip(boxes[:, 1], 0, origin_h - 1)
+    boxes[:, 3] = np.clip(boxes[:, 3], 0, origin_h - 1)
+    confs = boxes[:, 4]
+    boxes = boxes[np.argsort(-confs)]
+    keep_boxes = []
+    while boxes.shape[0]:
+        large_overlap = (bbox_iou(np.expand_dims(boxes[0, :4], 0), boxes[:, :4]) > nms_thres)
+        label_match = np.round(boxes[0, -1]) == np.round(boxes[:, -1])
+        # Indices of boxes with lower confidence scores, large IOUs and matching labels
+        invalid = large_overlap & label_match
+        keep_boxes += [boxes[0]]
+        boxes = boxes[~invalid]
+    boxes = np.stack(keep_boxes, 0) if len(keep_boxes) else np.array([])
+    return boxes
+
+
+def preprocess(img, stride=stride, input_width=input_width, input_height=input_height, np_dtype=np_dtype):
+    img = letterbox(img, max(input_width, input_height), stride=stride, auto=False)[0]
+    img = img[:, :, ::-1].transpose(2, 0, 1)
+    img = np.ascontiguousarray(img)
+    img = img.astype(np_dtype)
+    img = img / 255.0
+    img = img.reshape([1, *img.shape])
+    return img
+
+
+def post_process(output, origin_h, origin_w, input_height=input_height, input_width=input_width):
+    boxes = non_max_suppression(output, origin_h, origin_w, conf_thres = conf_thresh, nms_thres = IOU_THRESHOLD)
+    result_boxes = boxes[:, :4] if len(boxes) else np.array([])
+    result_scores = boxes[:, 4] if len(boxes) else np.array([])
+    result_classid = boxes[:, 5] if len(boxes) else np.array([])
+
+    result_boxes = scale_boxes((input_height, input_width), result_boxes, (origin_h, origin_w))
+    return result_boxes, result_scores, result_classid
+
+
+def postprocess(host_outputs, batch_origin_h, batch_origin_w, output_size=output_size, min_accuracy=0.5):
+    output = host_outputs[0]
+    answer = []
+    valid_scores = []
+    for i in range(batch_size):
+        result_boxes, result_scores, result_classid = post_process(output[i * output_size:(i + 1) * output_size], batch_origin_h, batch_origin_w)
+        for box, score in zip(result_boxes, result_scores):
+            if score > min_accuracy:
+                answer.append(box)
+                valid_scores.append(score)
+    return answer, valid_scores
+
+
+def draw_boxes(image, coords, scores):
+    box_color = (51, 51, 255)
+    font_color = (255, 255, 255)
+
+    line_width = max(round(sum(image.shape) / 2 * 0.0025), 2)
+    font_thickness = max(line_width - 1, 1)
+    draw_image = image.copy()
+
+    if coords and len(coords):
+        for idx, tb in enumerate(coords):
+            if tb[0] >= tb[2] or tb[1] >= tb[3]:
+                continue
+            obj_coords = list(map(int, tb[:4]))
+
+            # bbox
+            p1, p2 = (int(obj_coords[0]), int(obj_coords[1])), (
+                int(obj_coords[2]),
+                int(obj_coords[3]),
+            )
+            cv2.rectangle(
+                draw_image,
+                p1,
+                p2,
+                box_color,
+                thickness=line_width,
+                lineType=cv2.LINE_AA,
+            )
+
+            # Conf level
+            label = str(int(round(scores[idx], 2) * 100)) + "%"
+            w, h = cv2.getTextSize(label, 0, fontScale=2, thickness=3)[
+                0
+            ]  # text width, height
+            outside = obj_coords[1] - h - 3 >= 0  # label fits outside box
+
+            w, h = cv2.getTextSize(
+                label, 0, fontScale=line_width / 3, thickness=font_thickness
+            )[
+                0
+            ]  # text width, height
+            outside = p1[1] - h >= 3
+            p2 = p1[0] + w, p1[1] - h - 3 if outside else p1[1] + h + 3
+
+            cv2.rectangle(draw_image, p1, p2, box_color, -1, cv2.LINE_AA)  # filled
+            cv2.putText(
+                draw_image,
+                label,
+                (p1[0], p1[1] - 2 if outside else p1[1] + h + 2),
+                0,
+                line_width / 3,
+                font_color,
+                thickness=font_thickness,
+                lineType=cv2.LINE_AA,
+            )
+    return draw_image
+
+
+# image data
+src = f"data/videos/TLD120new.mp4"
+cap = cv2.VideoCapture(src)
 
 while True:
     ret, frame = cap.read()
     if not ret:
         break
-    out = run(frame=frame)
-    seen += 1
-    if len(out) == 6:
-        x1, y1, x2, y2, color, conf = out
-        color_queue.popleft()
-        color_queue.append(color)
-        # 如果队列中有red，且red的数量大于1，则认为是红灯
-        if 'red' in color_queue and color_queue.count('red') > 1:
-            color_max = 'red'
-        # 如果队列中有green，且green的数量大于2，则认为是绿灯
-        elif 'green' in color_queue and color_queue.count('green') > 3:
-            color_max = 'green'
-        else:
-            color_max = 'unknown'
-        print(f"Frame: {seen}, {color_max}")
-        cv2.putText(frame, f"Frame: {seen}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
-        if color_max != 'unknown':
-            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), 1, 2)
-            cv2.putText(frame, color_max, (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
-    else:
-        color_queue.popleft()
-        color_queue.append('unknown')
-        print(f"Frame: {seen}, {out}")
-        cv2.putText(frame, f"Frame: {seen}, {out}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
-    cv2.imshow('frame', frame)
-    # out_video.write(frame)
+
+    img = preprocess(frame)
+    pred = predict(img)
+    boxes, scores = postprocess(pred, frame.shape[0], frame.shape[1])
+    debug_image = draw_boxes(frame, boxes, scores)
+
+    cv2.imshow('Video', debug_image)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
+
 cap.release()
 cv2.destroyAllWindows()
